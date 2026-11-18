@@ -1,0 +1,77 @@
+# Lint, tests and security checks. The jobs live in
+# ChiefGyk3D/git-your-ship-together (GYST); this file only says what is
+# specific to Archimedes: it is a uv workspace, and every MCP package under
+# mcps/ carries its own test suite that the root pytest config never collects.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, Monday 06:00 UTC, so new advisories surface between commits
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/python-ci.yml@ff658b7c11a55eea1394af5fd1a3a1b4b09d9cd0 # v1.36.0
+    permissions:
+      contents: read
+      id-token: write   # python-ci declares it for its coverage job; unused here (no Codecov, no Doppler)
+    with:
+      # The MCP packages require Python >= 3.12 (root: >= 3.11, but the lock is shared).
+      python-versions: '["3.12", "3.13"]'
+      docker-build: false
+      install-command: |
+        python -m pip install --upgrade pip
+        pip install "uv==0.11.33"
+        uv sync --frozen --all-packages --all-extras --python "$(command -v python)"
+      # Each suite runs in its own pytest process: the packages share test file
+      # names (test_config.py, test_client.py) and have no __init__.py, so one
+      # combined run would fail on import-name collisions. Every suite runs
+      # even if an earlier one fails; the step fails if any did.
+      # test_integration.py needs live APIs and is left out.
+      test-command: |
+        rc=0
+        .venv/bin/python -m pytest tests -v || rc=1
+        for pkg in mcps/*/; do
+          .venv/bin/python -m pytest "${pkg}tests" -v --ignore-glob='*/test_integration.py' || rc=1
+        done
+        exit "$rc"
+
+  security:
+    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/security.yml@ff658b7c11a55eea1394af5fd1a3a1b4b09d9cd0 # v1.36.0
+    permissions:
+      contents: read
+      security-events: write   # declared by security.yml's SARIF jobs
+      pull-requests: write     # declared by security.yml's dependency-review job
+      id-token: write          # declared by security.yml's Snyk and Scorecard jobs
+    with:
+      # Only what was asked for: gitleaks and a dependency audit.
+      codeql: false
+      semgrep: false
+      dependency-review: false
+      # uv.lock is the source of truth; there is no requirements.txt.
+      pip-audit-requirements: ""
+      audit-install-command: pip install "uv==0.11.33" "pip-audit==2.10.1"
+      audit-command: |
+        uv export --frozen --all-packages --all-extras --no-hashes --no-emit-workspace --no-header -o "$RUNNER_TEMP/audit-requirements.txt"
+        pip-audit --requirement "$RUNNER_TEMP/audit-requirements.txt" --no-deps --disable-pip --strict
+
+  gate:
+    name: CI green
+    if: always()
+    needs: [ci, security]
+    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/ci-gate.yml@ff658b7c11a55eea1394af5fd1a3a1b4b09d9cd0 # v1.36.0
+    permissions: {}
+    with:
+      needs-json: '{"ci": "${{ needs.ci.result }}", "security": "${{ needs.security.result }}"}'
